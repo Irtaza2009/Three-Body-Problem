@@ -1,6 +1,8 @@
 // p5.js sketch
 let simulation;
 let canvasSize;
+let audioContext;
+let audioInitialized = false;
 
 function setup() {
     // Calculate canvas size based on window height
@@ -11,6 +13,17 @@ function setup() {
     
     simulation = new ThreeBodySimulation();
     simulation.setupControls();
+    
+    // Initialize audio on first user interaction
+    document.addEventListener('click', initializeAudio, { once: true });
+}
+
+function initializeAudio() {
+    if (!audioInitialized) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        simulation.setupAudio(audioContext);
+        audioInitialized = true;
+    }
 }
 
 function draw() {
@@ -46,8 +59,217 @@ class ThreeBodySimulation {
         this.showTrails = true;
         this.paused = false;
         this.boundaryRadius = 0;
+        this.audioContext = null;
+        this.lastBoundaryCollision = [0, 0, 0];
+        this.lastBodyInteraction = {};
         
         this.initializeBodies();
+    }
+    
+    setupAudio(audioContext) {
+        this.audioContext = audioContext;
+        console.log("Audio initialized");
+    }
+    
+    playBoundaryCollisionSound(body, impactStrength) {
+        if (!this.audioContext || this.paused) return;
+        
+        const now = this.audioContext.currentTime;
+        const minTimeBetweenCollisions = 0.1; // seconds
+        
+        // Prevent too many rapid collision sounds
+        if (now - this.lastBoundaryCollision[body.id - 1] < minTimeBetweenCollisions) {
+            return;
+        }
+        this.lastBoundaryCollision[body.id - 1] = now;
+        
+        // Create oscillator for the main tone
+        const oscillator = this.audioContext.createOscillator();
+        const gainNode = this.audioContext.createGain();
+        
+        // Map body color to frequency (RGB to frequency mapping)
+        const baseFreq = 180 + (body.color[0] * 0.5 + body.color[1] * 0.3 + body.color[2] * 0.2);
+        
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(baseFreq, now);
+        
+        // Add some frequency modulation based on impact strength
+        oscillator.frequency.exponentialRampToValueAtTime(baseFreq * 0.8, now + 0.1);
+        
+        // Configure volume envelope
+        gainNode.gain.setValueAtTime(0, now);
+        gainNode.gain.linearRampToValueAtTime(impactStrength * 0.3, now + 0.01);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+        
+        // Connect and play
+        oscillator.connect(gainNode);
+        gainNode.connect(this.audioContext.destination);
+        
+        oscillator.start(now);
+        oscillator.stop(now + 0.5);
+        
+        // Add a noise burst for impact
+        this.playNoiseBurst(impactStrength, now);
+    }
+    
+    playNoiseBurst(amplitude, startTime) {
+        const bufferSize = this.audioContext.sampleRate * 0.1;
+        const buffer = this.audioContext.createBuffer(1, bufferSize, this.audioContext.sampleRate);
+        const output = buffer.getChannelData(0);
+        
+        // Generate pink noise (more natural sounding)
+        for (let i = 0; i < bufferSize; i++) {
+            output[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / bufferSize, 2);
+        }
+        
+        const noiseSource = this.audioContext.createBufferSource();
+        const noiseGain = this.audioContext.createGain();
+        
+        noiseSource.buffer = buffer;
+        noiseGain.gain.setValueAtTime(amplitude * 0.1, startTime);
+        noiseGain.gain.exponentialRampToValueAtTime(0.001, startTime + 0.1);
+        
+        noiseSource.connect(noiseGain);
+        noiseGain.connect(this.audioContext.destination);
+        
+        noiseSource.start(startTime);
+        noiseSource.stop(startTime + 0.1);
+    }
+    
+    playGravitationalSound(body1, body2, closeness) {
+        if (!this.audioContext || this.paused) return;
+        
+        const now = this.audioContext.currentTime;
+        const interactionKey = `${Math.min(body1.id, body2.id)}-${Math.max(body1.id, body2.id)}`;
+        const minTimeBetweenInteractions = 0.3; // seconds
+        
+        // Prevent too many rapid interaction sounds
+        if (this.lastBodyInteraction[interactionKey] && 
+            now - this.lastBodyInteraction[interactionKey] < minTimeBetweenInteractions) {
+            return;
+        }
+        this.lastBodyInteraction[interactionKey] = now;
+        
+        // Create a beautiful chord-like sound for gravitational interaction
+        const frequencies = this.calculateHarmonicFrequencies(body1, body2, closeness);
+        
+        frequencies.forEach((freq, index) => {
+            const oscillator = this.audioContext.createOscillator();
+            const gainNode = this.audioContext.createGain();
+            const panNode = this.audioContext.createStereoPanner();
+            
+            oscillator.type = 'sine';
+            oscillator.frequency.setValueAtTime(freq, now);
+            
+            // Gentle panning based on body positions
+            const pan = (body1.x - body2.x) / width;
+            panNode.pan.setValueAtTime(constrain(pan, -0.7, 0.7), now);
+            
+            // Volume envelope - gentle swell and fade
+            const delay = index * 0.02;
+            const duration = 1.5 + index * 0.1;
+            
+            gainNode.gain.setValueAtTime(0, now + delay);
+            gainNode.gain.linearRampToValueAtTime(closeness * 0.15, now + delay + 0.2);
+            gainNode.gain.exponentialRampToValueAtTime(0.001, now + delay + duration);
+            
+            oscillator.connect(gainNode);
+            gainNode.connect(panNode);
+            panNode.connect(this.audioContext.destination);
+            
+            oscillator.start(now + delay);
+            oscillator.stop(now + delay + duration);
+        });
+        
+        // Add a subtle low-frequency oscillator for warmth
+        this.playLFOSweep(closeness, now);
+    }
+    
+    calculateHarmonicFrequencies(body1, body2, closeness) {
+        // Base frequency from body properties and distance
+        const baseFreq = 220 + (body1.mass + body2.mass) * 0.1;
+        
+        // Create a harmonic series based on the chord progression
+        const harmonics = [
+            baseFreq,                    // Fundamental
+            baseFreq * 1.2,             // Minor third
+            baseFreq * 1.5,             // Perfect fifth
+            baseFreq * 2,               // Octave
+            baseFreq * 2.4,             // Octave + minor third
+        ];
+        
+        // Filter harmonics based on closeness (more harmonics when closer)
+        return harmonics.slice(0, 2 + Math.floor(closeness * 3));
+    }
+    
+    playLFOSweep(amplitude, startTime) {
+        const oscillator = this.audioContext.createOscillator();
+        const lfo = this.audioContext.createOscillator();
+        const lfoGain = this.audioContext.createGain();
+        const gainNode = this.audioContext.createGain();
+        
+        // Very low frequency oscillator
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(55, startTime);
+        
+        // LFO for subtle pitch variation
+        lfo.type = 'sine';
+        lfo.frequency.setValueAtTime(0.5, startTime);
+        lfoGain.gain.setValueAtTime(2, startTime);
+        
+        lfo.connect(lfoGain);
+        lfoGain.connect(oscillator.frequency);
+        
+        // Volume envelope
+        gainNode.gain.setValueAtTime(0, startTime);
+        gainNode.gain.linearRampToValueAtTime(amplitude * 0.08, startTime + 0.5);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, startTime + 3);
+        
+        oscillator.connect(gainNode);
+        gainNode.connect(this.audioContext.destination);
+        
+        lfo.start(startTime);
+        oscillator.start(startTime);
+        
+        lfo.stop(startTime + 3);
+        oscillator.stop(startTime + 3);
+    }
+    
+    playDeflectionSound(body1, body2, forceMagnitude) {
+        if (!this.audioContext || this.paused) return;
+        
+        const now = this.audioContext.currentTime;
+        
+        // Create a "whoosh" sound for deflection
+        const oscillator = this.audioContext.createOscillator();
+        const filter = this.audioContext.createBiquadFilter();
+        const gainNode = this.audioContext.createGain();
+        
+        oscillator.type = 'sawtooth';
+        
+        // Frequency sweep for whoosh effect
+        const startFreq = 300 + forceMagnitude * 100;
+        const endFreq = 80;
+        
+        oscillator.frequency.setValueAtTime(startFreq, now);
+        oscillator.frequency.exponentialRampToValueAtTime(endFreq, now + 0.4);
+        
+        // Filter sweep
+        filter.type = 'lowpass';
+        filter.frequency.setValueAtTime(2000, now);
+        filter.frequency.exponentialRampToValueAtTime(200, now + 0.4);
+        
+        // Volume envelope
+        gainNode.gain.setValueAtTime(0, now);
+        gainNode.gain.linearRampToValueAtTime(forceMagnitude * 0.2, now + 0.05);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+        
+        oscillator.connect(filter);
+        filter.connect(gainNode);
+        gainNode.connect(this.audioContext.destination);
+        
+        oscillator.start(now);
+        oscillator.stop(now + 0.4);
     }
     
     initializeBodies() {
@@ -63,7 +285,8 @@ class ThreeBodySimulation {
                 mass: 120,
                 radius: 16,
                 color: [220, 100, 100],
-                trail: []
+                trail: [],
+                lastBoundaryCollision: 0
             },
             {
                 id: 2,
@@ -74,7 +297,8 @@ class ThreeBodySimulation {
                 mass: 120,
                 radius: 16,
                 color: [100, 150, 220],
-                trail: []
+                trail: [],
+                lastBoundaryCollision: 0
             },
             {
                 id: 3,
@@ -85,7 +309,8 @@ class ThreeBodySimulation {
                 mass: 120,
                 radius: 16,
                 color: [120, 220, 120],
-                trail: []
+                trail: [],
+                lastBoundaryCollision: 0
             }
         ];
     }
@@ -286,6 +511,22 @@ class ThreeBodySimulation {
                 body1.fy += fy;
                 body2.fx -= fx;
                 body2.fy -= fy;
+                
+                // Check for close approach for sound effects
+                const minDistanceForSound = 100;
+                const maxDistanceForSound = 300;
+                
+                if (distance < maxDistanceForSound) {
+                    const closeness = 1 - (distance - minDistanceForSound) / (maxDistanceForSound - minDistanceForSound);
+                    if (closeness > 0) {
+                        this.playGravitationalSound(body1, body2, closeness);
+                    }
+                }
+                
+                // Check for deflection (significant force change)
+                if (force > 50 && distance < 150) {
+                    this.playDeflectionSound(body1, body2, force / 100);
+                }
             }
         }
     }
@@ -307,6 +548,12 @@ class ThreeBodySimulation {
             
             // Calculate dot product of velocity and normal
             const dotProduct = body.vx * nx + body.vy * ny;
+            
+            // Calculate impact strength based on velocity
+            const impactStrength = Math.min(1, Math.abs(dotProduct) / 5);
+            
+            // Play collision sound
+            this.playBoundaryCollisionSound(body, impactStrength);
             
             // Reflect velocity across the normal (bounce)
             body.vx = body.vx - 2 * dotProduct * nx;
